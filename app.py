@@ -2,6 +2,7 @@ import os
 import base64
 import re
 import json
+import time
 
 import streamlit as st
 import openai
@@ -30,14 +31,17 @@ azure_openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
 azure_openai_key = os.environ.get("AZURE_OPENAI_KEY")
 authentication_required = str_to_bool(os.environ.get("AUTHENTICATION_REQUIRED", False))
 
-# User instructions
 USER_INSTRUCTIONS = """
-I want you to act as a legal assistant for an Italian law firm. Provide explanations, steps, and general legal information about Italian law, deeds, property transfers, contracts, and compliance. When necessary, translate legal terms between Italian and English.
- 
-Example questions I might ask:
-- “Quali sono i requisiti per aprire una SRL in Italia?”
-- “Explain the difference between usufruct and bare ownership in Italian law.”
-- “Draft a sample clause for a real estate purchase agreement under Italian law.”
+You are my Italian law assistant. Provide:
+- Complete deeds in .docx when I request “dammi un atto [type]”.
+- Explanations of any clause when I ask “spiegami la clausola [X] dell’atto di [type]”.
+- If something changes in external data, update the answer accordingly.
+USER_INSTRUCTIONS
+Example Queries:
+- “Dammi un atto di costituzione società tipo SPA”
+- “Spiegami la clausola di responsabilità nell’atto di SPA”
+- “Quali documenti servono per registrare una SRL in Italia?”
+
 """
 
 # Load authentication configuration
@@ -50,7 +54,7 @@ if authentication_required:
             st.secrets["cookie"]["expiry_days"],
         )
     else:
-        authenticator = None  # No authentication should be performed
+        authenticator = None
 
 client = None
 if azure_openai_endpoint and azure_openai_key:
@@ -64,18 +68,61 @@ else:
 
 
 class EventHandler(AssistantEventHandler):
+    def __init__(self):
+        super().__init__()
+
     @override
     def on_event(self, event):
-        pass
+        # Add debugging
+        print(f"Event received: {event.event}")
+        if hasattr(event, 'data') and hasattr(event.data, 'status'):
+            print(f"Run status: {event.data.status}")
+
+    @override
+    def on_run_step_created(self, run_step):
+        print(f"Run step created: {run_step.type}")
+        
+    @override
+    def on_run_step_done(self, run_step):
+        print(f"Run step completed: {run_step.type}")
+
+    @override
+    def on_run_step_failed(self, run_step):
+        print(f"Run step failed: {run_step.type}")
+        if run_step.last_error:
+            print(f"Error: {run_step.last_error}")
+            st.error(f"Run step failed: {run_step.last_error}")
+
+    @override 
+    def on_run_completed(self, run):
+        print(f"Run completed: {run.id}")
+        
+    @override
+    def on_run_failed(self, run):
+        print(f"Run failed: {run.id}")
+        if run.last_error:
+            print(f"Run error: {run.last_error}")
+            st.error(f"Run failed: {run.last_error}")
+            
+    @override
+    def on_run_cancelled(self, run):
+        print(f"Run cancelled: {run.id}")
+        
+    @override
+    def on_run_expired(self, run):
+        print(f"Run expired: {run.id}")
+        st.error("The assistant run has expired. Please try again.")
 
     @override
     def on_text_created(self, text):
+        print("Text created")
         st.session_state.current_message = ""
         with st.chat_message("Assistant"):
             st.session_state.current_markdown = st.empty()
 
     @override
     def on_text_delta(self, delta, snapshot):
+        print("Text delta: ", delta.value if delta.value else "None")
         if snapshot.value:
             text_value = re.sub(
                 r"\[(.*?)\]\s*\(\s*(.*?)\s*\)", "Download Link", snapshot.value
@@ -87,12 +134,14 @@ class EventHandler(AssistantEventHandler):
 
     @override
     def on_text_done(self, text):
+        print("Text done: ", text.value if text else "None")
         format_text = format_annotation(text)
         st.session_state.current_markdown.markdown(format_text, True)
         st.session_state.chat_log.append({"name": "assistant", "msg": format_text})
 
     @override
     def on_tool_call_created(self, tool_call):
+        print("Tool call created: ", tool_call.type)
         if tool_call.type == "code_interpreter":
             st.session_state.current_tool_input = ""
             with st.chat_message("Assistant"):
@@ -110,133 +159,237 @@ class EventHandler(AssistantEventHandler):
                 input_code = f"### code interpreter\ninput:\n```python\n{st.session_state.current_tool_input}\n```"
                 st.session_state.current_tool_input_markdown.markdown(input_code, True)
 
-            if delta.code_interpreter.outputs:
-                for output in delta.code_interpreter.outputs:
-                    if output.type == "logs":
-                        pass
-
     @override
     def on_tool_call_done(self, tool_call):
+        print(f"Tool call done: {tool_call.type}")
+        
+        # Prevent duplicate processing
+        if tool_call.id in [x.id for x in st.session_state.tool_calls]:
+            return
+            
         st.session_state.tool_calls.append(tool_call)
+        
         if tool_call.type == "code_interpreter":
-            if tool_call.id in [x.id for x in st.session_state.tool_calls]:
-                return
             input_code = f"### code interpreter\ninput:\n```python\n{tool_call.code_interpreter.input}\n```"
-            st.session_state.current_tool_input_markdown.markdown(input_code, True)
+            if 'current_tool_input_markdown' in st.session_state and st.session_state.current_tool_input_markdown:
+                st.session_state.current_tool_input_markdown.markdown(input_code, True)
             st.session_state.chat_log.append({"name": "assistant", "msg": input_code})
-            st.session_state.current_tool_input_markdown = None
+            
             for output in tool_call.code_interpreter.outputs:
                 if output.type == "logs":
-                    output = f"### code interpreter\noutput:\n```\n{output.logs}\n```"
+                    output_text = f"### code interpreter\noutput:\n```\n{output.logs}\n```"
                     with st.chat_message("Assistant"):
-                        st.markdown(output, True)
+                        st.markdown(output_text, True)
                         st.session_state.chat_log.append(
-                            {"name": "assistant", "msg": output}
+                            {"name": "assistant", "msg": output_text}
                         )
-        elif (
-            tool_call.type == "function"
-            and self.current_run.status == "requires_action"
-        ):
-            with st.chat_message("Assistant"):
-                msg = f"### Function Calling: {tool_call.function.name}"
-                st.markdown(msg, True)
-                st.session_state.chat_log.append({"name": "assistant", "msg": msg})
-            tool_calls = self.current_run.required_action.submit_tool_outputs.tool_calls
-            tool_outputs = []
-            for submit_tool_call in tool_calls:
-                tool_function_name = submit_tool_call.function.name
-                tool_function_arguments = json.loads(
-                    submit_tool_call.function.arguments
-                )
-                tool_function_output = TOOL_MAP[tool_function_name](
-                    **tool_function_arguments
-                )
-                tool_outputs.append(
-                    {
-                        "tool_call_id": submit_tool_call.id,
-                        "output": tool_function_output,
-                    }
-                )
+                elif output.type == "image":
+                    # Handle image outputs
+                    with st.chat_message("Assistant"):
+                        st.image(f"data:image/png;base64,{output.image.file_id}")
+                        
+        elif tool_call.type == "function":
+            # Handle function calls - get the current run from the context
+            self.handle_function_call(tool_call)
 
-            with client.beta.threads.runs.submit_tool_outputs_stream(
-                thread_id=st.session_state.thread.id,
-                run_id=self.current_run.id,
-                tool_outputs=tool_outputs,
-                event_handler=EventHandler(),
-            ) as stream:
-                stream.until_done()
+    @override
+    def on_run_requires_action(self, run, run_step):
+        """Handle when the run requires action (function calls)"""
+        print(f"Run requires action: {run.id}")
+        tool_calls = run.required_action.submit_tool_outputs.tool_calls
+        tool_outputs = []
+        
+        for tool_call in tool_calls:
+            try:
+                tool_function_name = tool_call.function.name
+                tool_function_arguments = json.loads(tool_call.function.arguments)
+                
+                with st.chat_message("Assistant"):
+                    msg = f"### Function Calling: {tool_function_name}"
+                    st.markdown(msg, True)
+                    st.session_state.chat_log.append({"name": "assistant", "msg": msg})
+                
+                if tool_function_name in TOOL_MAP:
+                    tool_function_output = TOOL_MAP[tool_function_name](**tool_function_arguments)
+                    tool_outputs.append({
+                        "tool_call_id": tool_call.id,
+                        "output": str(tool_function_output),
+                    })
+                else:
+                    print(f"Unknown function: {tool_function_name}")
+                    tool_outputs.append({
+                        "tool_call_id": tool_call.id,
+                        "output": f"Error: Unknown function {tool_function_name}",
+                    })
+                    
+            except Exception as e:
+                print(f"Error executing function {tool_call.function.name}: {e}")
+                tool_outputs.append({
+                    "tool_call_id": tool_call.id,
+                    "output": f"Error: {str(e)}",
+                })
+        
+        # Submit tool outputs with streaming
+        if tool_outputs:
+            try:
+                with client.beta.threads.runs.submit_tool_outputs_stream(
+                    thread_id=st.session_state.thread.id,
+                    run_id=run.id,
+                    tool_outputs=tool_outputs,
+                    event_handler=EventHandler(),
+                ) as stream:
+                    stream.until_done()
+            except Exception as e:
+                print(f"Error submitting tool outputs: {e}")
+
+    def handle_function_call(self, tool_call):
+        """Handle function tool calls - deprecated in favor of on_run_requires_action"""
+        print(f"Function call handled via on_run_requires_action: {tool_call.function.name}")
+
+    @override
+    def on_exception(self, exception):
+        print(f"Exception occurred: {exception}")
+        st.error(f"An error occurred: {str(exception)}")
 
 
 def create_thread(content, file):
-    return client.beta.threads.create()
+    """Create a new thread"""
+    try:
+        return client.beta.threads.create()
+    except Exception as e:
+        print(f"Error creating thread: {e}")
+        st.error(f"Error creating thread: {str(e)}")
+        return None
 
 
 def create_message(thread, content, file):
-    attachments = []
-    if file is not None:
-        attachments.append(
-            {"file_id": file.id, "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]}
+    """Create a message in the thread"""
+    try:
+        attachments = []
+        if file is not None:
+            attachments.append({
+                "file_id": file.id, 
+                "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]
+            })
+            
+        message = client.beta.threads.messages.create(
+            thread_id=thread.id, 
+            role="user", 
+            content=content, 
+            attachments=attachments
         )
-    client.beta.threads.messages.create(
-        thread_id=thread.id, role="user", content=content, attachments=attachments
-    )
+        print(f"Message created: {message.id}")
+        return message
+    except Exception as e:
+        print(f"Error creating message: {e}")
+        st.error(f"Error creating message: {str(e)}")
+        return None
 
 
 def create_file_link(file_name, file_id):
-    content = client.files.content(file_id)
-    content_type = content.response.headers["content-type"]
-    b64 = base64.b64encode(content.text.encode(content.encoding)).decode()
-    link_tag = f'<a href="data:{content_type};base64,{b64}" download="{file_name}">Download Link</a>'
-    return link_tag
+    """Create downloadable file link"""
+    try:
+        content = client.files.content(file_id)
+        content_type = content.response.headers["content-type"]
+        b64 = base64.b64encode(content.text.encode(content.encoding)).decode()
+        link_tag = f'<a href="data:{content_type};base64,{b64}" download="{file_name}">Download Link</a>'
+        return link_tag
+    except Exception as e:
+        print(f"Error creating file link: {e}")
+        return "Download Link"
 
 
 def format_annotation(text):
-    citations = []
-    text_value = text.value
-    for index, annotation in enumerate(text.annotations):
-        text_value = text_value.replace(annotation.text, f" [{index}]")
+    """Format text with annotations and citations"""
+    try:
+        citations = []
+        text_value = text.value
+        
+        for index, annotation in enumerate(text.annotations):
+            text_value = text_value.replace(annotation.text, f" [{index}]")
 
-        if file_citation := getattr(annotation, "file_citation", None):
-            cited_file = client.files.retrieve(file_citation.file_id)
-            citations.append(
-                f"[{index}] {file_citation.quote} from {cited_file.filename}"
-            )
-        elif file_path := getattr(annotation, "file_path", None):
-            link_tag = create_file_link(
-                annotation.text.split("/")[-1],
-                file_path.file_id,
-            )
-            text_value = re.sub(r"\[(.*?)\]\s*\(\s*(.*?)\s*\)", link_tag, text_value)
-    text_value += "\n\n" + "\n".join(citations)
-    return text_value
+            if file_citation := getattr(annotation, "file_citation", None):
+                cited_file = client.files.retrieve(file_citation.file_id)
+                citations.append(
+                    f"[{index}] {file_citation.quote} from {cited_file.filename}"
+                )
+            elif file_path := getattr(annotation, "file_path", None):
+                link_tag = create_file_link(
+                    annotation.text.split("/")[-1],
+                    file_path.file_id,
+                )
+                text_value = re.sub(r"\[(.*?)\]\s*\(\s*(.*?)\s*\)", link_tag, text_value)
+                
+        if citations:
+            text_value += "\n\n" + "\n".join(citations)
+        return text_value
+    except Exception as e:
+        print(f"Error formatting annotation: {e}")
+        return text.value if text else ""
 
 
 def run_stream(user_input, file, selected_assistant_id):
-    if "thread" not in st.session_state:
-        st.session_state.thread = create_thread(user_input, file)
-    create_message(st.session_state.thread, user_input, file)
-    with client.beta.threads.runs.stream(
-        thread_id=st.session_state.thread.id,
-        assistant_id=selected_assistant_id,
-        event_handler=EventHandler(),
-        instructions=USER_INSTRUCTIONS, 
-        max_completion_tokens=1024
-    ) as stream:
-        stream.until_done()
+    """Run the assistant with streaming"""
+    try:
+        # Create thread if it doesn't exist
+        if "thread" not in st.session_state or st.session_state.thread is None:
+            st.session_state.thread = create_thread(user_input, file)
+            if st.session_state.thread is None:
+                return
+        
+        # Create message
+        message = create_message(st.session_state.thread, user_input, file)
+        if message is None:
+            return
+            
+        # Verify assistant exists
+        try:
+            assistant = client.beta.assistants.retrieve(selected_assistant_id)
+            print(f"Using assistant: {assistant.name}")
+        except Exception as e:
+            st.error(f"Assistant not found: {selected_assistant_id}")
+            print(f"Assistant error: {e}")
+            return
+        
+        # Create event handler
+        event_handler = EventHandler()
+        
+        # Start streaming run
+        print(f"Starting run with assistant: {selected_assistant_id}")
+        with client.beta.threads.runs.stream(
+            thread_id=st.session_state.thread.id,
+            assistant_id=selected_assistant_id,
+            event_handler=event_handler,
+            instructions=USER_INSTRUCTIONS if USER_INSTRUCTIONS else None
+        ) as stream:
+            stream.until_done()
+            
+    except Exception as e:
+        print(f"Error in run_stream: {e}")
+        st.error(f"Error running assistant: {str(e)}")
 
 
 def handle_uploaded_file(uploaded_file):
-    file = client.files.create(file=uploaded_file, purpose="assistants")
-    return file
+    """Handle file upload to OpenAI"""
+    try:
+        file = client.files.create(file=uploaded_file, purpose="assistants")
+        print(f"Upload file: {file.id}")
+        return file
+    except Exception as e:
+        print(f"Error uploading file: {e}")
+        st.error(f"Error uploading file: {str(e)}")
+        return None
 
 
 def render_chat():
+    """Render chat messages"""
     for chat in st.session_state.chat_log:
         with st.chat_message(chat["name"]):
             st.markdown(chat["msg"], True)
 
 
-if "tool_call" not in st.session_state:
+# Initialize session state
+if "tool_calls" not in st.session_state:
     st.session_state.tool_calls = []
 
 if "chat_log" not in st.session_state:
@@ -244,6 +397,9 @@ if "chat_log" not in st.session_state:
 
 if "in_progress" not in st.session_state:
     st.session_state.in_progress = False
+
+if "thread" not in st.session_state:
+    st.session_state.thread = None
 
 
 def disable_form():
@@ -258,55 +414,70 @@ def login():
 
 
 def reset_chat():
+    """Reset chat and create new thread"""
     st.session_state.chat_log = []
     st.session_state.in_progress = False
+    st.session_state.thread = None
+    st.session_state.tool_calls = []
 
 
 def load_chat_screen(assistant_id, assistant_title):
+    """Load the main chat interface"""
+    # File uploader
+    uploaded_file = None
     if enabled_file_upload_message:
         uploaded_file = st.sidebar.file_uploader(
             enabled_file_upload_message,
-            type=[
-                "txt",
-                "pdf",
-                "csv",
-                "json",
-                "geojson",
-                "xlsx",
-                "xls",
-            ],
+            type=["txt", "pdf", "csv", "json", "geojson", "xlsx", "xls"],
             disabled=st.session_state.in_progress,
         )
-    else:
-        uploaded_file = None
 
-    st.title(assistant_title if assistant_title else "")
+    # Reset chat button
+    if st.sidebar.button("Reset Chat"):
+        reset_chat()
+        st.rerun()
+
+    st.title(assistant_title if assistant_title else "Assistant")
+    
+    # Chat input
     user_msg = st.chat_input(
         "Message", on_submit=disable_form, disabled=st.session_state.in_progress
     )
+    
     if user_msg:
         render_chat()
+        
+        # Display user message
         with st.chat_message("user"):
             st.markdown(user_msg, True)
         st.session_state.chat_log.append({"name": "user", "msg": user_msg})
 
+        # Handle file upload
         file = None
         if uploaded_file is not None:
             file = handle_uploaded_file(uploaded_file)
+            if file:
+                with st.chat_message("user"):
+                    st.info(f"File uploaded: {uploaded_file.name}")
+        
+        # Run assistant
         run_stream(user_msg, file, assistant_id)
+        
+        # Reset progress state
         st.session_state.in_progress = False
-        st.session_state.tool_call = None
         st.rerun()
 
     render_chat()
 
 
 def main():
-    # Check if multi-agent settings are defined
+    """Main application function"""
+    # Check configuration
     multi_agents = os.environ.get("OPENAI_ASSISTANTS", None)
     single_agent_id = os.environ.get("ASSISTANT_ID", None)
     single_agent_title = os.environ.get("ASSISTANT_TITLE", "Assistants API UI")
 
+    # Handle authentication
     if (
         authentication_required
         and "credentials" in st.secrets
@@ -319,21 +490,25 @@ def main():
         else:
             authenticator.logout(location="sidebar")
 
+    # Load assistant configuration
     if multi_agents:
-        assistants_json = json.loads(multi_agents)
-        assistants_object = {f'{obj["title"]}': obj for obj in assistants_json}
-        selected_assistant = st.sidebar.selectbox(
-            "Select an assistant profile?",
-            list(assistants_object.keys()),
-            index=None,
-            placeholder="Select an assistant profile...",
-            on_change=reset_chat,  # Call the reset function on change
-        )
-        if selected_assistant:
-            load_chat_screen(
-                assistants_object[selected_assistant]["id"],
-                assistants_object[selected_assistant]["title"],
+        try:
+            assistants_json = json.loads(multi_agents)
+            assistants_object = {f'{obj["title"]}': obj for obj in assistants_json}
+            selected_assistant = st.sidebar.selectbox(
+                "Select an assistant profile?",
+                list(assistants_object.keys()),
+                index=None,
+                placeholder="Select an assistant profile...",
+                on_change=reset_chat,
             )
+            if selected_assistant:
+                load_chat_screen(
+                    assistants_object[selected_assistant]["id"],
+                    assistants_object[selected_assistant]["title"],
+                )
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON in OPENAI_ASSISTANTS: {e}")
     elif single_agent_id:
         load_chat_screen(single_agent_id, single_agent_title)
     else:
