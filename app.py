@@ -30,6 +30,16 @@ azure_openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
 azure_openai_key = os.environ.get("AZURE_OPENAI_KEY")
 authentication_required = str_to_bool(os.environ.get("AUTHENTICATION_REQUIRED", False))
 
+# User instructions
+USER_INSTRUCTIONS = """
+I want you to act as a legal assistant for an Italian law firm. Provide explanations, steps, and general legal information about Italian law, deeds, property transfers, contracts, and compliance. When necessary, translate legal terms between Italian and English.
+ 
+Example questions I might ask:
+- “Quali sono i requisiti per aprire una SRL in Italia?”
+- “Explain the difference between usufruct and bare ownership in Italian law.”
+- “Draft a sample clause for a real estate purchase agreement under Italian law.”
+"""
+
 # Load authentication configuration
 if authentication_required:
     if "credentials" in st.secrets:
@@ -209,6 +219,8 @@ def run_stream(user_input, file, selected_assistant_id):
         thread_id=st.session_state.thread.id,
         assistant_id=selected_assistant_id,
         event_handler=EventHandler(),
+        instructions=USER_INSTRUCTIONS, 
+        max_completion_tokens=1024
     ) as stream:
         stream.until_done()
 
